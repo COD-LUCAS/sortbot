@@ -1,234 +1,162 @@
-import os
-import logging
-import re
-import pandas as pd
-import threading
-import time
-from flask import Flask
+import { Telegraf } from "telegraf";
+import express from "express";
+import fs from "fs";
+import path from "path";
+import multer from "multer";
+import csv from "csv-parser";
+import xlsx from "xlsx";
+import dotenv from "dotenv";
+dotenv.config();
 
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    CommandHandler,
-    ContextTypes,
-    filters
-)
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const FOOTER = "\n\n⚡ Powered by @codlucas";
+const pending = {};
+const upload = multer({ dest: "uploads/" });
 
-# Disable spam logs
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
+// -------------------------------------------------------
+// Fancy Number Functions
+// -------------------------------------------------------
+function extractNumbers(text) {
+    const matches = text.match(/\+?\d{8,15}/g) || [];
+    return [...new Set(matches.map(n => n.replace("+", "")))];
+}
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT_TOKEN_HERE")
-FOOTER = "\n\n⚡ Powered by @codlucas"
+function findFancyPatterns(num) {
+    num = String(num);
+    let score = 0;
 
-pending_requests = {}
+    if (/(.)\1{2,}/.test(num)) score++; // repeated
+    if (/0123|1234|2345|3456|4567|5678|6789/.test(num)) score++; // up
+    if (/9876|8765|7654|6543|5432|4321|3210/.test(num)) score++; // down
+    if (/(\d\d)\1+/.test(num)) score++; // double
+    if (/(\d)(\d)\2\1/.test(num)) score++; // palindrome
 
-# ----------------------------
-#  WEB SERVER (port 8080)
-# ----------------------------
-app = Flask(__name__)
+    return score;
+}
 
-@app.route("/")
-def home():
-    return "Bot running on Render Free Plan!"
+function sortFancy(numbers) {
+    return numbers
+        .map(n => ({ n, score: findFancyPatterns(n) }))
+        .filter(obj => obj.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .map(obj => obj.n);
+}
 
-# ----------------------------
-#  Fancy number pattern check
-# ----------------------------
-
-def extract_numbers_from_text(text):
-    matches = re.findall(r"\+?\d{8,15}", text)
-    numbers = [m.replace("+", "") for m in matches]
-    return list(set(numbers))
-
-def find_fancy_patterns(num):
-    num = str(num)
-    patterns = 0
-
-    # Repeated digits
-    if re.search(r"(\d)\1{2,}", num):
-        patterns += 1
-
-    # Sequential up
-    if re.search(r"(0123|1234|2345|3456|4567|5678|6789)", num):
-        patterns += 1
-
-    # Sequential down
-    if re.search(r"(9876|8765|7654|6543|5432|4321|3210)", num):
-        patterns += 1
-
-    # Double pattern
-    if re.search(r"(\d\d)\1+", num):
-        patterns += 1
-
-    # Palindrome
-    if re.search(r"(\d)(\d)\2\1", num):
-        patterns += 1
-
-    return patterns
-
-def sort_fancy(numbers):
-    scored = []
-    for n in numbers:
-        score = find_fancy_patterns(n)
-        if score > 0:
-            scored.append((n, score))
-
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [x[0] for x in scored]
-
-# ----------------------------
-# Handlers
-# ----------------------------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Send a TXT / CSV / XLSX file with numbers.\n"
-        "I will sort the best fancy numbers for you!"
-        + FOOTER
+// -------------------------------------------------------
+// Telegram Handlers
+// -------------------------------------------------------
+bot.start(ctx =>
+    ctx.reply(
+        "👋 Send a TXT / CSV / XLSX file with numbers.\nI will sort the best fancy numbers for you!" + FOOTER
     )
+);
 
-async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    doc = update.message.document
+bot.on("document", async ctx => {
+    const userId = ctx.from.id;
+    const file = await ctx.telegram.getFile(ctx.message.document.file_id);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
 
-    await update.message.reply_text("📥 Reading file..." + FOOTER)
+    const filePath = path.join("uploads", ctx.message.document.file_name);
+    const writer = fs.createWriteStream(filePath);
 
-    file = await doc.get_file()
-    file_path = f"/tmp/{doc.file_name}"
-    await file.download_to_drive(file_path)
+    ctx.reply("📥 Reading file..." + FOOTER);
 
-    name = doc.file_name.lower()
+    const response = await fetch(fileUrl);
+    const buffer = await response.arrayBuffer();
+    fs.writeFileSync(filePath, Buffer.from(buffer));
 
-    try:
-        if name.endswith(".txt"):
-            with open(file_path, "r") as f:
-                content = f.read()
-            numbers = extract_numbers_from_text(content)
+    let numbers = [];
 
-        elif name.endswith(".csv"):
-            df = pd.read_csv(file_path)
-            content = "\n".join(df.astype(str).stack())
-            numbers = extract_numbers_from_text(content)
+    try {
+        const lower = filePath.toLowerCase();
 
-        elif name.endswith(".xlsx"):
-            df = pd.read_excel(file_path)
-            content = "\n".join(df.astype(str).stack())
-            numbers = extract_numbers_from_text(content)
+        if (lower.endsWith(".txt")) {
+            const content = fs.readFileSync(filePath, "utf8");
+            numbers = extractNumbers(content);
 
-        else:
-            return await update.message.reply_text("❌ Unsupported file." + FOOTER)
+        } else if (lower.endsWith(".csv")) {
+            let text = "";
+            await new Promise(resolve => {
+                fs.createReadStream(filePath)
+                    .pipe(csv())
+                    .on("data", row => {
+                        text += Object.values(row).join("\n") + "\n";
+                    })
+                    .on("end", resolve);
+            });
+            numbers = extractNumbers(text);
 
-        if not numbers:
-            return await update.message.reply_text("❌ No numbers found." + FOOTER)
+        } else if (lower.endsWith(".xlsx")) {
+            const sheet = xlsx.readFile(filePath);
+            let text = "";
+            sheet.SheetNames.forEach(name => {
+                text += xlsx.utils.sheet_to_csv(sheet.Sheets[name]) + "\n";
+            });
+            numbers = extractNumbers(text);
+        } else {
+            return ctx.reply("❌ Unsupported file." + FOOTER);
+        }
 
-        pending_requests[user_id] = numbers
+        if (!numbers.length) {
+            return ctx.reply("❌ No numbers found." + FOOTER);
+        }
 
-        await update.message.reply_text(
-            f"📊 Found *{len(numbers)}* numbers.\n"
-            "Send how many fancy numbers you want to list.\nExample: `50`"
-            + FOOTER,
-            parse_mode="Markdown"
-        )
+        pending[userId] = numbers;
 
-    except Exception as e:
-        await update.message.reply_text("❌ Error: " + str(e) + FOOTER)
+        ctx.reply(
+            `📊 Found *${numbers.length}* numbers.\nSend how many fancy numbers you want.\nExample: \`50\`` +
+                FOOTER,
+            { parse_mode: "Markdown" }
+        );
 
-async def number_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    msg = update.message.text.strip()
+    } catch (err) {
+        ctx.reply("❌ Error: " + err.message + FOOTER);
+    }
+});
 
-    if not msg.isdigit():
-        return
-    if user_id not in pending_requests:
-        return
+bot.on("text", async ctx => {
+    const userId = ctx.from.id;
+    const msg = ctx.message.text.trim();
 
-    limit = int(msg)
-    numbers = pending_requests.pop(user_id)
+    if (!/^\d+$/.test(msg)) return;
+    if (!pending[userId]) return;
 
-    await update.message.reply_text("⏳ Sorting..." + FOOTER)
+    const limit = parseInt(msg);
+    const numbers = pending[userId];
+    delete pending[userId];
 
-    fancy = sort_fancy(numbers)
+    ctx.reply("⏳ Sorting..." + FOOTER);
 
-    if not fancy:
-        return await update.message.reply_text("❌ No fancy numbers found." + FOOTER)
+    const fancy = sortFancy(numbers);
 
-    top = fancy[:limit]
+    if (!fancy.length) {
+        return ctx.reply("❌ No fancy numbers found." + FOOTER);
+    }
 
-    # Build output format
-    result = f"🏆 *Top {len(top)} Fancy Numbers:*\n```"
-    for i, num in enumerate(top, start=1):
-        if not num.startswith("+"):
-            num = "+" + num
-        result += f"\n{i}. {num}"
-    result += "\n```" + FOOTER
+    const top = fancy.slice(0, limit);
 
-    await update.message.reply_text(result, parse_mode="Markdown")
+    let out = `🏆 *Top ${top.length} Fancy Numbers:*\n\`\`\``;
+    top.forEach((n, i) => (out += `\n${i + 1}. +${n}`));
+    out += `\n\`\`\`${FOOTER}`;
 
-    # Remaining numbers
-    if len(fancy) > limit:
-        remaining_path = "/tmp/remaining.txt"
-        with open(remaining_path, "w") as f:
-            for n in fancy[limit:]:
-                f.write("+" + n + "\n")
+    await ctx.reply(out, { parse_mode: "Markdown" });
 
-        await update.message.reply_document(
-            document=open(remaining_path, "rb"),
-            caption="📄 Remaining Fancy Numbers"
-        )
+    if (fancy.length > limit) {
+        const remPath = "uploads/remaining.txt";
+        fs.writeFileSync(remPath, fancy.slice(limit).map(n => "+" + n).join("\n"));
+        await ctx.replyWithDocument({ source: remPath, filename: "remaining.txt" });
+    }
+});
 
-# ----------------------------
-# Bot Auto-Restart Function
-# ----------------------------
+// -------------------------------------------------------
+// Express Web Server (for Railway alive)
+// -------------------------------------------------------
+const app = express();
+app.get("/", (req, res) => res.send("Bot is running!"));
+app.listen(process.env.PORT || 3000, () => console.log("Web server running"));
 
-def run_bot_polling():
-    """Run bot in separate thread with auto-restart on failure"""
-    restart_count = 0
-    
-    while True:
-        try:
-            print(f"🤖 Bot starting... (Restart #{restart_count})")
-            
-            application = ApplicationBuilder().token(BOT_TOKEN).build()
-            
-            application.add_handler(CommandHandler("start", start))
-            application.add_handler(MessageHandler(filters.Document.ALL, file_handler))
-            application.add_handler(MessageHandler(filters.TEXT, number_input))
-            
-            print("✅ Bot is now running and listening for updates...")
-            
-            # Run with increased timeouts
-            application.run_polling(
-                drop_pending_updates=True,
-                pool_timeout=60,
-                connect_timeout=60,
-                read_timeout=60,
-                write_timeout=60,
-                close_loop=False
-            )
-            
-        except Exception as e:
-            restart_count += 1
-            print(f"❌ Bot crashed: {e}")
-            print(f"🔄 Restarting in 5 seconds... (Attempt #{restart_count})")
-            time.sleep(5)
-
-# ----------------------------
-# Start Bot
-# ----------------------------
-
-def main():
-    print("🚀 Starting Telegram Bot Service...")
-    
-    # Start bot in separate thread with auto-restart
-    bot_thread = threading.Thread(target=run_bot_polling, daemon=False)
-    bot_thread.start()
-    
-    print("🌐 Starting Flask web server on port 8080...")
-    
-    # Run Flask on main thread (this keeps Render happy)
-    app.run(host="0.0.0.0", port=8080)
-
-if __name__ == "__main__":
-    main()
+// -------------------------------------------------------
+// Start Bot
+// -------------------------------------------------------
+bot.launch();
+console.log("Bot started successfully!");
