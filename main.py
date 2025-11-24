@@ -3,6 +3,7 @@ import logging
 import re
 import pandas as pd
 import threading
+import time
 from flask import Flask
 
 from telegram import Update
@@ -31,11 +32,6 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     return "Bot running on Render Free Plan!"
-
-def run_web():
-    app.run(host="0.0.0.0", port=8080)
-
-threading.Thread(target=run_web).start()
 
 # ----------------------------
 #  Fancy number pattern check
@@ -183,17 +179,56 @@ async def number_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 # ----------------------------
+# Bot Auto-Restart Function
+# ----------------------------
+
+def run_bot_polling():
+    """Run bot in separate thread with auto-restart on failure"""
+    restart_count = 0
+    
+    while True:
+        try:
+            print(f"🤖 Bot starting... (Restart #{restart_count})")
+            
+            application = ApplicationBuilder().token(BOT_TOKEN).build()
+            
+            application.add_handler(CommandHandler("start", start))
+            application.add_handler(MessageHandler(filters.Document.ALL, file_handler))
+            application.add_handler(MessageHandler(filters.TEXT, number_input))
+            
+            print("✅ Bot is now running and listening for updates...")
+            
+            # Run with increased timeouts
+            application.run_polling(
+                drop_pending_updates=True,
+                pool_timeout=60,
+                connect_timeout=60,
+                read_timeout=60,
+                write_timeout=60,
+                close_loop=False
+            )
+            
+        except Exception as e:
+            restart_count += 1
+            print(f"❌ Bot crashed: {e}")
+            print(f"🔄 Restarting in 5 seconds... (Attempt #{restart_count})")
+            time.sleep(5)
+
+# ----------------------------
 # Start Bot
 # ----------------------------
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Document.ALL, file_handler))
-    app.add_handler(MessageHandler(filters.TEXT, number_input))
-
-    app.run_polling()
+    print("🚀 Starting Telegram Bot Service...")
+    
+    # Start bot in separate thread with auto-restart
+    bot_thread = threading.Thread(target=run_bot_polling, daemon=False)
+    bot_thread.start()
+    
+    print("🌐 Starting Flask web server on port 8080...")
+    
+    # Run Flask on main thread (this keeps Render happy)
+    app.run(host="0.0.0.0", port=8080)
 
 if __name__ == "__main__":
     main()
