@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: fancy-number-bot
+    env: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
