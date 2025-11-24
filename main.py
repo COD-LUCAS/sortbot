@@ -1,157 +1,143 @@
 import os
 import logging
-import pandas as pd
 import re
-from flask import Flask
+import pandas as pd
 import threading
+from flask import Flask
 
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
     CommandHandler,
-    filters,
-    ContextTypes
+    ContextTypes,
+    filters
 )
 
-# Logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+# Disable spam logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT_TOKEN_HERE")
 FOOTER = "\n\n⚡ Powered by @codlucas"
 
 pending_requests = {}
 
-# ---------------------------
-# SMALL WEB SERVER FOR RENDER
-# ---------------------------
+# ----------------------------
+#  WEB SERVER (port 8080)
+# ----------------------------
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot Running!"
+    return "Bot running on Render Free Plan!"
 
 def run_web():
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=8080)
 
 threading.Thread(target=run_web).start()
 
-
-# ---------------------------
-# NUMBER EXTRACTION FUNCTIONS
-# ---------------------------
+# ----------------------------
+#  Fancy number pattern check
+# ----------------------------
 
 def extract_numbers_from_text(text):
-    numbers = []
     matches = re.findall(r"\+?\d{8,15}", text)
-    for m in matches:
-        numbers.append(m.replace("+", ""))  # clean +, we re-add later
+    numbers = [m.replace("+", "") for m in matches]
     return list(set(numbers))
 
-
 def find_fancy_patterns(num):
-    patterns = []
     num = str(num)
+    patterns = 0
 
-    repeated = re.findall(r"(\d)\1{2,}", num)
-    for m in repeated:
-        patterns.append(("Repeated", m, len(m) * 10))
+    # Repeated digits
+    if re.search(r"(\d)\1{2,}", num):
+        patterns += 1
 
-    seq_up = re.findall(r"(?:0123|1234|2345|3456|4567|5678|6789)", num)
-    for m in seq_up:
-        patterns.append(("Seq Up", m, len(m) * 8))
+    # Sequential up
+    if re.search(r"(0123|1234|2345|3456|4567|5678|6789)", num):
+        patterns += 1
 
-    seq_down = re.findall(r"(?:9876|8765|7654|6543|5432|4321|3210)", num)
-    for m in seq_down:
-        patterns.append(("Seq Down", m, len(m) * 8))
+    # Sequential down
+    if re.search(r"(9876|8765|7654|6543|5432|4321|3210)", num):
+        patterns += 1
 
-    double = re.findall(r"(\d\d)\1+", num)
-    for m in double:
-        patterns.append(("Double", m, len(m) * 6))
+    # Double pattern
+    if re.search(r"(\d\d)\1+", num):
+        patterns += 1
 
-    pal = re.findall(r"(\d)(\d)\2\1", num)
-    for m in pal:
-        patterns.append(("Palindrome", "".join(m), 15))
+    # Palindrome
+    if re.search(r"(\d)(\d)\2\1", num):
+        patterns += 1
 
     return patterns
 
-
-def analyze_fancy(numbers):
-    result = []
+def sort_fancy(numbers):
+    scored = []
     for n in numbers:
-        patterns = find_fancy_patterns(n)
-        if patterns:
-            score = sum(x[2] for x in patterns)
-            result.append({"number": n, "patterns": patterns, "score": score})
-    return sorted(result, key=lambda x: x["score"], reverse=True)
+        score = find_fancy_patterns(n)
+        if score > 0:
+            scored.append((n, score))
 
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [x[0] for x in scored]
 
-# ---------------------------
-# HANDLERS
-# ---------------------------
+# ----------------------------
+# Handlers
+# ----------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Send me any TXT / CSV / XLSX file containing numbers.\n"
-        "I will extract & sort the *best fancy numbers*.\n" + FOOTER,
-        parse_mode="Markdown"
+        "👋 Send a TXT / CSV / XLSX file with numbers.\n"
+        "I will sort the best fancy numbers for you!"
+        + FOOTER
     )
-
 
 async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    document = update.message.document
+    doc = update.message.document
 
-    await update.message.reply_text("📥 Processing your file..." + FOOTER)
+    await update.message.reply_text("📥 Reading file..." + FOOTER)
 
-    file = await document.get_file()
-    file_name = document.file_name.lower()
-    path = f"/tmp/{file_name}"
-    await file.download_to_drive(path)
+    file = await doc.get_file()
+    file_path = f"/tmp/{doc.file_name}"
+    await file.download_to_drive(file_path)
+
+    name = doc.file_name.lower()
 
     try:
-        if file_name.endswith(".txt"):
-            with open(path, "r") as f:
+        if name.endswith(".txt"):
+            with open(file_path, "r") as f:
                 content = f.read()
             numbers = extract_numbers_from_text(content)
 
-        elif file_name.endswith(".csv"):
-            df = pd.read_csv(path)
-            content = "\n".join(df.astype(str).stack().tolist())
+        elif name.endswith(".csv"):
+            df = pd.read_csv(file_path)
+            content = "\n".join(df.astype(str).stack())
             numbers = extract_numbers_from_text(content)
 
-        elif file_name.endswith(".xlsx"):
-            df = pd.read_excel(path)
-            content = "\n".join(df.astype(str).stack().tolist())
+        elif name.endswith(".xlsx"):
+            df = pd.read_excel(file_path)
+            content = "\n".join(df.astype(str).stack())
             numbers = extract_numbers_from_text(content)
 
         else:
-            return await update.message.reply_text(
-                "❌ Unsupported file type." + FOOTER
-            )
+            return await update.message.reply_text("❌ Unsupported file." + FOOTER)
 
         if not numbers:
-            return await update.message.reply_text(
-                "❌ No numbers found." + FOOTER
-            )
+            return await update.message.reply_text("❌ No numbers found." + FOOTER)
 
         pending_requests[user_id] = numbers
 
         await update.message.reply_text(
             f"📊 Found *{len(numbers)}* numbers.\n"
-            "Send how many *TOP fancy numbers* you want.\n\nExample: `50`"
+            "Send how many fancy numbers you want to list.\nExample: `50`"
             + FOOTER,
             parse_mode="Markdown"
         )
 
     except Exception as e:
-        await update.message.reply_text(
-            f"❌ Error: {e}" + FOOTER
-        )
-
+        await update.message.reply_text("❌ Error: " + str(e) + FOOTER)
 
 async def number_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
@@ -162,55 +148,43 @@ async def number_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in pending_requests:
         return
 
-    count = int(msg)
+    limit = int(msg)
     numbers = pending_requests.pop(user_id)
 
-    await update.message.reply_text("⏳ Sorting fancy numbers..." + FOOTER)
+    await update.message.reply_text("⏳ Sorting..." + FOOTER)
 
-    fancy = analyze_fancy(numbers)
+    fancy = sort_fancy(numbers)
 
     if not fancy:
-        return await update.message.reply_text(
-            "❌ No fancy numbers found." + FOOTER
-        )
+        return await update.message.reply_text("❌ No fancy numbers found." + FOOTER)
 
-    top = fancy[:count]
+    top = fancy[:limit]
 
-    # ==============================
-    # FORMATTED OUTPUT EXACT STYLE
-    # ==============================
-
-    result = f"🏆 *Top {len(top)} Fancy Numbers (Best First):*\n```"
-
-    for i, item in enumerate(top, start=1):
-        num = item["number"]
+    # Build output format
+    result = f"🏆 *Top {len(top)} Fancy Numbers:*\n```"
+    for i, num in enumerate(top, start=1):
         if not num.startswith("+"):
             num = "+" + num
-        result += f"\n{i}. {num} (Score: {item['score']})"
-
+        result += f"\n{i}. {num}"
     result += "\n```" + FOOTER
 
     await update.message.reply_text(result, parse_mode="Markdown")
 
-    # ---- Remaining file ----
-    if len(fancy) > count:
-        rem_path = "/tmp/remaining.txt"
-        with open(rem_path, "w") as f:
-            for item in fancy[count:]:
-                num = item["number"]
-                if not num.startswith("+"):
-                    num = "+" + num
-                f.write(num + "\n")
+    # Remaining numbers
+    if len(fancy) > limit:
+        remaining_path = "/tmp/remaining.txt"
+        with open(remaining_path, "w") as f:
+            for n in fancy[limit:]:
+                f.write("+" + n + "\n")
 
         await update.message.reply_document(
-            document=open(rem_path, "rb"),
-            caption="📄 Remaining fancy numbers\n" + FOOTER
+            document=open(remaining_path, "rb"),
+            caption="📄 Remaining Fancy Numbers"
         )
 
-
-# ---------------------------
-# MAIN BOT RUNNER
-# ---------------------------
+# ----------------------------
+# Start Bot
+# ----------------------------
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -220,7 +194,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT, number_input))
 
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
