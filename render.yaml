@@ -1,8 +1,8 @@
 services:
-  - type: web
+  - type: worker
     name: fancy-number-bot
     env: docker
-    plan: starter
+    plan: free
     autoDeploy: true
     envVars:
       - key: BOT_TOKEN
