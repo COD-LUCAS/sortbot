@@ -1,162 +1,236 @@
-import { Telegraf } from "telegraf";
-import express from "express";
-import fs from "fs";
-import path from "path";
-import multer from "multer";
-import csv from "csv-parser";
-import xlsx from "xlsx";
-import dotenv from "dotenv";
-dotenv.config();
+import os
+import logging
+import re
+import pandas as pd
+import threading
+import json
+from flask import Flask
+from datetime import datetime
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const FOOTER = "\n\n⚡ Powered by @codlucas";
-const pending = {};
-const upload = multer({ dest: "uploads/" });
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    MessageHandler,
+    CommandHandler,
+    ContextTypes,
+    filters
+)
 
-// -------------------------------------------------------
-// Fancy Number Functions
-// -------------------------------------------------------
-function extractNumbers(text) {
-    const matches = text.match(/\+?\d{8,15}/g) || [];
-    return [...new Set(matches.map(n => n.replace("+", "")))];
-}
+# -----------------------------
+# CONFIG
+# -----------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "BOT_TOKEN_HERE")
+OWNER_ID = 7384941543
+FOOTER = "\n\n⚡ Powered by @codlucas"
 
-function findFancyPatterns(num) {
-    num = String(num);
-    let score = 0;
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
-    if (/(.)\1{2,}/.test(num)) score++; // repeated
-    if (/0123|1234|2345|3456|4567|5678|6789/.test(num)) score++; // up
-    if (/9876|8765|7654|6543|5432|4321|3210/.test(num)) score++; // down
-    if (/(\d\d)\1+/.test(num)) score++; // double
-    if (/(\d)(\d)\2\1/.test(num)) score++; // palindrome
+pending_requests = {}
 
-    return score;
-}
+# -----------------------------
+# USER DATABASE
+# -----------------------------
+def save_user(user_id):
+    try:
+        if not os.path.exists("users.json"):
+            with open("users.json", "w") as f:
+                f.write("[]")
 
-function sortFancy(numbers) {
-    return numbers
-        .map(n => ({ n, score: findFancyPatterns(n) }))
-        .filter(obj => obj.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .map(obj => obj.n);
-}
+        with open("users.json", "r") as f:
+            data = json.load(f)
 
-// -------------------------------------------------------
-// Telegram Handlers
-// -------------------------------------------------------
-bot.start(ctx =>
-    ctx.reply(
-        "👋 Send a TXT / CSV / XLSX file with numbers.\nI will sort the best fancy numbers for you!" + FOOTER
+        if user_id not in data:
+            data.append(user_id)
+            with open("users.json", "w") as f:
+                json.dump(data, f, indent=2)
+
+    except Exception as e:
+        print("Error saving user:", e)
+
+
+# -----------------------------
+# FANCY NUMBER CHECK (NO SCORE)
+# -----------------------------
+def extract_numbers_from_text(text):
+    matches = re.findall(r"\+?\d{8,15}", text)
+    return list(set(m.replace("+", "") for m in matches))
+
+def is_fancy(num):
+    num = str(num)
+
+    if re.search(r"(.)\1{2,}", num): return True
+    if re.search(r"(0123|1234|2345|3456|4567|5678|6789)", num): return True
+    if re.search(r"(9876|8765|7654|6543|5432|4321|3210)", num): return True
+    if re.search(r"(\d\d)\1+", num): return True
+    if re.search(r"(\d)(\d)\2\1", num): return True
+
+    return False
+
+def filter_fancy(numbers):
+    return [n for n in numbers if is_fancy(n)]
+
+
+# -----------------------------
+# WEB SERVER (RENDER KEEP-ALIVE)
+# -----------------------------
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot is running on Render Plan!"
+
+def run_web():
+    app.run(host="0.0.0.0", port=8080)
+
+threading.Thread(target=run_web).start()
+
+
+# -----------------------------
+# TELEGRAM HANDLERS
+# -----------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_user(update.message.from_user.id)
+
+    await update.message.reply_text(
+        "👋 Send a TXT / CSV / XLSX file with numbers.\n"
+        "I will extract all fancy numbers for you!"
+        + FOOTER
     )
-);
 
-bot.on("document", async ctx => {
-    const userId = ctx.from.id;
-    const file = await ctx.telegram.getFile(ctx.message.document.file_id);
-    const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${file.file_path}`;
 
-    const filePath = path.join("uploads", ctx.message.document.file_name);
-    const writer = fs.createWriteStream(filePath);
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
 
-    ctx.reply("📥 Reading file..." + FOOTER);
+    if user_id != OWNER_ID:
+        return await update.message.reply_text("❌ You are not authorized.")
 
-    const response = await fetch(fileUrl);
-    const buffer = await response.arrayBuffer();
-    fs.writeFileSync(filePath, Buffer.from(buffer));
+    text = update.message.text.replace("/broadcast", "").strip()
+    if not text:
+        return await update.message.reply_text("Usage: /broadcast your message")
 
-    let numbers = [];
+    try:
+        with open("users.json", "r") as f:
+            users = json.load(f)
+    except:
+        users = []
 
-    try {
-        const lower = filePath.toLowerCase();
+    sent = 0
+    fail = 0
 
-        if (lower.endsWith(".txt")) {
-            const content = fs.readFileSync(filePath, "utf8");
-            numbers = extractNumbers(content);
+    await update.message.reply_text(f"📢 Broadcasting to {len(users)} users...")
 
-        } else if (lower.endsWith(".csv")) {
-            let text = "";
-            await new Promise(resolve => {
-                fs.createReadStream(filePath)
-                    .pipe(csv())
-                    .on("data", row => {
-                        text += Object.values(row).join("\n") + "\n";
-                    })
-                    .on("end", resolve);
-            });
-            numbers = extractNumbers(text);
+    for uid in users:
+        try:
+            await context.bot.send_message(uid, text)
+            sent += 1
+        except:
+            fail += 1
 
-        } else if (lower.endsWith(".xlsx")) {
-            const sheet = xlsx.readFile(filePath);
-            let text = "";
-            sheet.SheetNames.forEach(name => {
-                text += xlsx.utils.sheet_to_csv(sheet.Sheets[name]) + "\n";
-            });
-            numbers = extractNumbers(text);
-        } else {
-            return ctx.reply("❌ Unsupported file." + FOOTER);
-        }
+    await update.message.reply_text(
+        f"✅ Broadcast Done!\n\nSent: {sent}\nFailed: {fail}"
+    )
 
-        if (!numbers.length) {
-            return ctx.reply("❌ No numbers found." + FOOTER);
-        }
 
-        pending[userId] = numbers;
+async def file_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_user(update.message.from_user.id)
 
-        ctx.reply(
-            `📊 Found *${numbers.length}* numbers.\nSend how many fancy numbers you want.\nExample: \`50\`` +
-                FOOTER,
-            { parse_mode: "Markdown" }
-        );
+    doc = update.message.document
+    user_id = update.message.from_user.id
 
-    } catch (err) {
-        ctx.reply("❌ Error: " + err.message + FOOTER);
-    }
-});
+    await update.message.reply_text("📥 Reading file..." + FOOTER)
 
-bot.on("text", async ctx => {
-    const userId = ctx.from.id;
-    const msg = ctx.message.text.trim();
+    file = await doc.get_file()
+    file_path = f"/tmp/{doc.file_name}"
+    await file.download_to_drive(file_path)
 
-    if (!/^\d+$/.test(msg)) return;
-    if (!pending[userId]) return;
+    name = doc.file_name.lower()
 
-    const limit = parseInt(msg);
-    const numbers = pending[userId];
-    delete pending[userId];
+    try:
+        if name.endswith(".txt"):
+            with open(file_path, "r", encoding="utf8", errors="ignore") as f:
+                content = f.read()
+            numbers = extract_numbers_from_text(content)
 
-    ctx.reply("⏳ Sorting..." + FOOTER);
+        elif name.endswith(".csv"):
+            df = pd.read_csv(file_path)
+            content = "\n".join(df.astype(str).stack())
+            numbers = extract_numbers_from_text(content)
 
-    const fancy = sortFancy(numbers);
+        elif name.endswith(".xlsx"):
+            df = pd.read_excel(file_path)
+            content = "\n".join(df.astype(str).stack())
+            numbers = extract_numbers_from_text(content)
 
-    if (!fancy.length) {
-        return ctx.reply("❌ No fancy numbers found." + FOOTER);
-    }
+        else:
+            return await update.message.reply_text("❌ Unsupported file." + FOOTER)
 
-    const top = fancy.slice(0, limit);
+        pending_requests[user_id] = numbers
 
-    let out = `🏆 *Top ${top.length} Fancy Numbers:*\n\`\`\``;
-    top.forEach((n, i) => (out += `\n${i + 1}. +${n}`));
-    out += `\n\`\`\`${FOOTER}`;
+        await update.message.reply_text(
+            f"📊 Found *{len(numbers)}* numbers.\n"
+            "Send how many fancy numbers you want.\nExample: `50`"
+            + FOOTER,
+            parse_mode="Markdown"
+        )
 
-    await ctx.reply(out, { parse_mode: "Markdown" });
+    except Exception as e:
+        await update.message.reply_text("❌ Error: " + str(e) + FOOTER)
 
-    if (fancy.length > limit) {
-        const remPath = "uploads/remaining.txt";
-        fs.writeFileSync(remPath, fancy.slice(limit).map(n => "+" + n).join("\n"));
-        await ctx.replyWithDocument({ source: remPath, filename: "remaining.txt" });
-    }
-});
 
-// -------------------------------------------------------
-// Express Web Server (for Railway alive)
-// -------------------------------------------------------
-const app = express();
-app.get("/", (req, res) => res.send("Bot is running!"));
-app.listen(process.env.PORT || 3000, () => console.log("Web server running"));
+async def number_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    msg = update.message.text.strip()
 
-// -------------------------------------------------------
-// Start Bot
-// -------------------------------------------------------
-bot.launch();
-console.log("Bot started successfully!");
+    if not msg.isdigit():  
+        return
+    if user_id not in pending_requests:
+        return
+
+    limit = int(msg)
+    numbers = pending_requests.pop(user_id)
+
+    await update.message.reply_text("⏳ Extracting fancy numbers..." + FOOTER)
+
+    fancy = filter_fancy(numbers)
+
+    if not fancy:
+        return await update.message.reply_text("❌ No fancy numbers found." + FOOTER)
+
+    top = fancy[:limit]
+
+    result = f"🏆 *Top {len(top)} Fancy Numbers:*\n```"
+    for i, num in enumerate(top, 1):
+        result += f"\n{i}. +{num}"
+    result += "\n```" + FOOTER
+
+    await update.message.reply_text(result, parse_mode="Markdown")
+
+    if len(fancy) > limit:
+        remaining = "/tmp/remaining.txt"
+        with open(remaining, "w") as f:
+            for n in fancy[limit:]:
+                f.write("+" + n + "\n")
+
+        await update.message.reply_document(
+            document=open(remaining, "rb"),
+            caption="📄 Remaining Fancy Numbers"
+        )
+
+
+# -----------------------------
+# START BOT
+# -----------------------------
+def main():
+    app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(CommandHandler("broadcast", broadcast))
+    app_bot.add_handler(MessageHandler(filters.Document.ALL, file_handler))
+    app_bot.add_handler(MessageHandler(filters.TEXT, number_input))
+
+    app_bot.run_polling()
+
+
+if __name__ == "__main__":
+    main()
